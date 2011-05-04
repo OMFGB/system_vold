@@ -218,6 +218,7 @@ int Volume::formatVol() {
 
     setState(Volume::State_Formatting);
 
+    int ret = -1;
     // Only initialize the MBR if we are formatting the entire device
     if (formatEntireDevice) {
         sprintf(devicePath, "/dev/block/vold/%d:%d",
@@ -232,6 +233,15 @@ int Volume::formatVol() {
     sprintf(devicePath, "/dev/block/vold/%d:%d",
             MAJOR(partNode), MINOR(partNode));
 
+#ifdef VOLD_EMMC_SHARES_DEV_MAJOR
+    // If emmc and sdcard share dev major number, vold may pick
+    // incorrectly based on partition nodes alone, formatting
+    // the wrong device. Use device nodes instead.
+    dev_t deviceNodes;
+    getDeviceNodes((dev_t *) &deviceNodes, 1);
+    sprintf(devicePath, "/dev/block/vold/%d:%d", MAJOR(deviceNodes), MINOR(deviceNodes));
+#endif
+
     if (mDebug) {
         SLOGI("Formatting volume %s (%s)", getLabel(), devicePath);
     }
@@ -241,10 +251,11 @@ int Volume::formatVol() {
         goto err;
     }
 
-    setState(Volume::State_Idle);
-    return 0;
+    ret = 0;
+
 err:
-    return -1;
+    setState(Volume::State_Idle);
+    return ret;
 }
 
 bool Volume::isMountpointMounted(const char *path) {
@@ -318,7 +329,7 @@ int Volume::mountVol() {
 
         if (Fat::check(devicePath)) {
             if (errno == ENODATA) {
-                SLOGW("%s does not contain a FAT filesystem\n", devicePath);
+                SLOGW("%s does not contain a FAT or EXT4 filesystem\n", devicePath);
                 continue;
             }
             errno = EIO;
@@ -335,7 +346,7 @@ int Volume::mountVol() {
         errno = 0;
         if (Fat::doMount(devicePath, "/mnt/secure/staging", false, false, false,
                 1000, 1015, 0702, true)) {
-            SLOGE("%s failed to mount via VFAT (%s)\n", devicePath, strerror(errno));
+            SLOGE("%s failed to mount (%s)\n", devicePath, strerror(errno));
             continue;
         }
 
@@ -343,7 +354,11 @@ int Volume::mountVol() {
 
         protectFromAutorunStupidity();
 
-        if (createBindMounts()) {
+        /* There can be only one SEC_ASECDIR, so let it be EXTERNAL_STORAGE */
+        const char *externalPath = getenv("EXTERNAL_STORAGE") ?: "/mnt/sdcard";
+        if (0 != strcmp(getMountpoint(), externalPath)) {
+            SLOGI("Skipping bindmounts for alternate volume (%s)", getMountpoint());
+        } else if (createBindMounts()) {
             SLOGE("Failed to create bindmounts (%s)", strerror(errno));
             umount("/mnt/secure/staging");
             setState(Volume::State_Idle);
@@ -526,24 +541,28 @@ int Volume::unmountVol(bool force) {
 
     protectFromAutorunStupidity();
 
-    /*
-     * Unmount the tmpfs which was obscuring the asec image directory
-     * from non root users
-     */
+    /* Undo createBindMounts(), which is only called for EXTERNAL_STORAGE */
+    const char *externalPath = getenv("EXTERNAL_STORAGE") ?: "/mnt/sdcard";
+    if (0 == strcmp(getMountpoint(), externalPath)) {
+        /*
+         * Unmount the tmpfs which was obscuring the asec image directory
+         * from non root users
+         */
 
-    if (doUnmount(Volume::SEC_STG_SECIMGDIR, force)) {
-        SLOGE("Failed to unmount tmpfs on %s (%s)", SEC_STG_SECIMGDIR, strerror(errno));
-        goto fail_republish;
-    }
+        if (doUnmount(Volume::SEC_STG_SECIMGDIR, force)) {
+            SLOGE("Failed to unmount tmpfs on %s (%s)", SEC_STG_SECIMGDIR, strerror(errno));
+            goto fail_republish;
+        }
 
-    /*
-     * Remove the bindmount we were using to keep a reference to
-     * the previously obscured directory.
-     */
+        /*
+         * Remove the bindmount we were using to keep a reference to
+         * the previously obscured directory.
+         */
 
-    if (doUnmount(Volume::SEC_ASECDIR, force)) {
-        SLOGE("Failed to remove bindmount on %s (%s)", SEC_ASECDIR, strerror(errno));
-        goto fail_remount_tmpfs;
+        if (doUnmount(Volume::SEC_ASECDIR, force)) {
+            SLOGE("Failed to remove bindmount on %s (%s)", SEC_ASECDIR, strerror(errno));
+            goto fail_remount_tmpfs;
+        }
     }
 
     /*

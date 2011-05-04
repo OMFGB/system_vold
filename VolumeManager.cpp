@@ -42,6 +42,10 @@
 #include "Process.h"
 #include "Asec.h"
 
+#ifndef CUSTOM_LUN_FILE
+#define CUSTOM_LUN_FILE "/sys/devices/platform/usb_mass_storage/lun"
+#endif
+
 VolumeManager *VolumeManager::sInstance = NULL;
 
 VolumeManager *VolumeManager::Instance() {
@@ -55,13 +59,17 @@ VolumeManager::VolumeManager() {
     mVolumes = new VolumeCollection();
     mActiveContainers = new AsecIdCollection();
     mBroadcaster = NULL;
-    mUsbMassStorageEnabled = false;
-    mUsbConnected = false;
     mUmsSharingCount = 0;
     mSavedDirtyRatio = -1;
     // set dirty ratio to 0 when UMS is active
     mUmsDirtyRatio = 0;
 
+
+#ifdef USE_USB_MASS_STORAGE_SWITCH
+    mUsbMassStorageConnected = false;
+#else
+    mUsbConnected = false;
+    mUsbMassStorageEnabled = false;
     readInitialState();
 }
 
@@ -96,6 +104,7 @@ void VolumeManager::readInitialState() {
     } else {
         SLOGD("usb_configuration switch is not enabled in the kernel");
     }
+#endif
 }
 
 VolumeManager::~VolumeManager() {
@@ -156,12 +165,26 @@ int VolumeManager::addVolume(Volume *v) {
     return 0;
 }
 
+#ifdef USE_USB_MASS_STORAGE_SWITCH
+void VolumeManager::notifyUmsConnected(bool connected) {
+#else
 void VolumeManager::notifyUmsAvailable(bool available) {
+#endif
     char msg[255];
 
+#ifdef USE_USB_MASS_STORAGE_SWITCH
+    if (connected) {
+        mUsbMassStorageConnected = true;
+    } else {
+        mUsbMassStorageConnected = false;
+    }
+    snprintf(msg, sizeof(msg), "Share method ums now %s",
+             (connected ? "available" : "unavailable"));
+#else
     snprintf(msg, sizeof(msg), "Share method ums now %s",
              (available ? "available" : "unavailable"));
     SLOGD(msg);
+#endif
     getBroadcaster()->sendBroadcast(ResponseCode::ShareAvailabilityChange,
                                     msg, false);
 }
@@ -176,6 +199,13 @@ void VolumeManager::handleSwitchEvent(NetlinkEvent *evt) {
         return;
     }
 
+#ifdef USE_USB_MASS_STORAGE_SWITCH
+    if (!strcmp(name, "usb_mass_storage")) {
+        if (!strcmp(state, "online"))  {
+            notifyUmsConnected(true);
+        } else {
+            notifyUmsConnected(false);
+#else
     bool oldAvailable = massStorageAvailable();
     if (!strcmp(name, "usb_configuration")) {
         mUsbConnected = !strcmp(state, "1");
@@ -183,11 +213,13 @@ void VolumeManager::handleSwitchEvent(NetlinkEvent *evt) {
         bool newAvailable = massStorageAvailable();
         if (newAvailable != oldAvailable) {
             notifyUmsAvailable(newAvailable);
+#endif
         }
     } else {
         SLOGW("Ignoring unknown switch '%s'", name);
     }
 }
+#ifndef USE_USB_MASS_STORAGE_SWITCH
 void VolumeManager::handleUsbCompositeEvent(NetlinkEvent *evt) {
     const char *function = evt->findParam("FUNCTION");
     const char *enabled = evt->findParam("ENABLED");
@@ -207,6 +239,7 @@ void VolumeManager::handleUsbCompositeEvent(NetlinkEvent *evt) {
         }
     }
 }
+#endif
 
 void VolumeManager::handleBlockEvent(NetlinkEvent *evt) {
     const char *devpath = evt->findParam("DEVPATH");
@@ -969,7 +1002,14 @@ int VolumeManager::shareAvailable(const char *method, bool *avail) {
         return -1;
     }
 
+#ifdef USE_USB_MASS_STORAGE_SWITCH
+    if (mUsbMassStorageConnected)
+        *avail = true;
+    else
+        *avail = false;
+#else
     *avail = massStorageAvailable();
+#endif
     return 0;
 }
 
@@ -998,9 +1038,18 @@ int VolumeManager::simulate(const char *cmd, const char *arg) {
 
     if (!strcmp(cmd, "ums")) {
         if (!strcmp(arg, "connect")) {
+
+#ifdef USE_USB_MASS_STORAGE_SWITCH
+            notifyUmsConnected(true);
+#else
             notifyUmsAvailable(true);
+#endif
         } else if (!strcmp(arg, "disconnect")) {
+#ifdef USE_USB_MASS_STORAGE_SWITCH
+            notifyUmsConnected(false);
+#else
             notifyUmsAvailable(false);
+#endif
         } else {
             errno = EINVAL;
             return -1;
@@ -1054,10 +1103,21 @@ int VolumeManager::shareVolume(const char *label, const char *method) {
              sizeof(nodepath), "/dev/block/vold/%d:%d",
              MAJOR(d), MINOR(d));
 
-    if ((fd = open("/sys/devices/platform/usb_mass_storage/lun0/file",
-                   O_WRONLY)) < 0) {
-        SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
-        return -1;
+    // TODO: Currently only two mounts are supported, defaulting
+    // /mnt/sdcard to lun0 and anything else to lun1. Fix this.
+    if (0 == strcmp(label, "/mnt/sdcard")) {
+        if ((fd = open(CUSTOM_LUN_FILE"0/file",
+                       O_WRONLY)) < 0) {
+            SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
+            return -1;
+        }
+    }
+    else {
+        if ((fd = open(CUSTOM_LUN_FILE"1/file",
+                       O_WRONLY)) < 0) {
+            SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
+            return -1;
+        }
     }
 
     if (write(fd, nodepath, strlen(nodepath)) < 0) {
@@ -1105,9 +1165,19 @@ int VolumeManager::unshareVolume(const char *label, const char *method) {
     }
 
     int fd;
-    if ((fd = open("/sys/devices/platform/usb_mass_storage/lun0/file", O_WRONLY)) < 0) {
-        SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
-        return -1;
+
+    // /mnt/sdcard to lun0 and anything else to lun1. Fix this.
+    if (0 == strcmp(label, "/mnt/sdcard")) {
+        if ((fd = open(CUSTOM_LUN_FILE"0/file", O_WRONLY)) < 0) {
+            SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
+            return -1;
+        }
+    }
+    else {
+        if ((fd = open(CUSTOM_LUN_FILE"1/file", O_WRONLY)) < 0) {
+            SLOGE("Unable to open ums lunfile (%s)", strerror(errno));
+            return -1;
+        }
     }
 
     char ch = 0;
@@ -1202,6 +1272,11 @@ bool VolumeManager::isMountpointMounted(const char *mp)
 }
 
 int VolumeManager::cleanupAsec(Volume *v, bool force) {
+    /* Only EXTERNAL_STORAGE needs ASEC cleanup. */
+    const char *externalPath = getenv("EXTERNAL_STORAGE") ?: "/mnt/sdcard";
+    if (0 != strcmp(v->getMountpoint(), externalPath))
+        return 0;
+
     while(mActiveContainers->size()) {
         AsecIdCollection::iterator it = mActiveContainers->begin();
         ContainerData* cd = *it;
